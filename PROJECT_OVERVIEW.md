@@ -13,9 +13,10 @@ affected Jira user stories when business requirements change.
 
 ## Technology Stack
 - Python
-- Sentence Transformers
+- Fast Embed
 - NetworkX
-- Large Language Models
+- Ollama+Qwen3
 - FastAPI
-- React
+- Streamlit
 - Jira REST API
+- PostgreSQL
