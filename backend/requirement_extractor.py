@@ -14,384 +14,484 @@ VALID_CATEGORIES = {
     "OPEN_QUESTION"
 }
 
+MAX_CHUNK_CHARS = 4500
 
-def _parse_response(response_text: str) -> dict:
-    """Parse the JSON returned by the local language model."""
 
-    if not isinstance(response_text, str) or not response_text.strip():
-        raise ValueError("The AI returned an empty response.")
+# ---------------------------------------------------------
+# 1. Split the document into smaller chunks
+# ---------------------------------------------------------
 
-    cleaned = re.sub(
-        r"^```(?:json)?\s*|\s*```$",
+def split_document_into_chunks(document_text: str) -> list[str]:
+    """
+    Split document text into smaller chunks while keeping
+    paragraphs together whenever possible.
+    """
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in document_text.splitlines()
+        if paragraph.strip()
+    ]
+
+    chunks = []
+    current_chunk = ""
+
+    for paragraph in paragraphs:
+
+        if len(paragraph) > MAX_CHUNK_CHARS:
+
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+
+            for start in range(0, len(paragraph), MAX_CHUNK_CHARS):
+                chunks.append(
+                    paragraph[start:start + MAX_CHUNK_CHARS]
+                )
+
+            continue
+
+        if len(current_chunk) + len(paragraph) + 1 <= MAX_CHUNK_CHARS:
+
+            current_chunk += (
+                "\n" + paragraph if current_chunk else paragraph
+            )
+
+        else:
+            chunks.append(current_chunk)
+            current_chunk = paragraph
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+# ---------------------------------------------------------
+# 2. Parse the JSON response from Ollama
+# ---------------------------------------------------------
+
+def parse_json_response(response_text: str) -> dict:
+    """
+    Extract a JSON object from the model response.
+    """
+
+    cleaned_response = response_text.strip()
+
+    cleaned_response = re.sub(
+        r"^```(?:json)?\s*",
         "",
-        response_text.strip(),
+        cleaned_response,
         flags=re.IGNORECASE
     )
 
-    try:
-        result = json.loads(cleaned)
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            f"The AI returned invalid JSON: {error}"
-        ) from error
+    cleaned_response = re.sub(
+        r"\s*```$",
+        "",
+        cleaned_response
+    )
 
-    if not isinstance(result, dict):
-        raise ValueError("AI response must be a JSON object.")
+    start = cleaned_response.find("{")
+    end = cleaned_response.rfind("}")
 
-    if not isinstance(result.get("requirements"), list):
+    if start == -1 or end == -1:
+        raise ValueError("No JSON object found in model response.")
+
+    return json.loads(cleaned_response[start:end + 1])
+
+
+# ---------------------------------------------------------
+# 3. Validate an individual requirement
+# ---------------------------------------------------------
+
+def validate_requirement(requirement: dict) -> bool:
+
+    if not isinstance(requirement, dict):
+        return False
+
+    category = requirement.get("category")
+    description = requirement.get("description")
+    source = requirement.get("source")
+
+    if category not in VALID_CATEGORIES:
+        return False
+
+    if not isinstance(description, str) or not description.strip():
+        return False
+
+    if not isinstance(source, str) or not source.strip():
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------
+# 4. Extract requirements from one document chunk
+# ---------------------------------------------------------
+
+def extract_from_chunk(
+    chunk: str,
+    chunk_number: int
+) -> list[dict]:
+
+    prompt = f"""
+You are a professional business and software requirements analyst.
+
+Extract all distinct requirements from the document section below.
+
+SECTION NUMBER: {chunk_number}
+
+DOCUMENT SECTION:
+{chunk}
+
+Use exactly one of these categories:
+
+FUNCTIONAL:
+A capability or behaviour the system must provide.
+
+BUSINESS_RULE:
+A business policy, calculation rule, threshold or decision rule.
+
+NON_FUNCTIONAL:
+A quality requirement such as performance, security,
+reliability, usability or auditability.
+
+CONSTRAINT:
+A technical, regulatory, operational or implementation restriction.
+
+ASSUMPTION:
+Something believed to be true but not yet confirmed.
+
+OPEN_QUESTION:
+Something requiring clarification or a decision.
+
+IMPORTANT INSTRUCTIONS:
+
+1. Preserve exact amounts, numbers, percentages, thresholds,
+   conditions and exceptions.
+
+2. Distinguish existing behaviour from newly requested behaviour.
+
+3. Do not invent requirements or missing information.
+
+4. Do not convert assumptions or open questions into confirmed
+   requirements.
+
+5. Extract each distinct requirement separately.
+
+6. Do not combine multiple independent requirements into one
+   general statement.
+
+7. Do not repeat the same requirement using different wording.
+
+8. Include a source reference identifying the relevant heading,
+   paragraph, page or section.
+
+9. If an exact source heading is unavailable, use section
+   number {chunk_number}.
+
+10. Do not generate requirement IDs.
+
+Return ONLY valid JSON:
+
+{{
+  "requirements": [
+    {{
+      "category": "FUNCTIONAL",
+      "description": "Requirement description.",
+      "source": "Relevant source reference."
+    }}
+  ]
+}}
+
+If no requirements are found, return:
+
+{{
+  "requirements": []
+}}
+"""
+
+    response = generate_response(prompt)
+    parsed = parse_json_response(response)
+
+    requirements = parsed.get("requirements")
+
+    if not isinstance(requirements, list):
         raise ValueError(
-            "AI response does not contain a requirements list."
+            f"Invalid requirements list in section {chunk_number}."
         )
 
-    return result
+    valid_requirements = []
+
+    for requirement in requirements:
+
+        if validate_requirement(requirement):
+
+            valid_requirements.append({
+                "category": requirement["category"],
+                "description": requirement["description"].strip(),
+                "source": requirement["source"].strip()
+            })
+
+    return valid_requirements
 
 
-def _validate_requirements(requirements: list[dict]) -> list[dict]:
-    """Validate extracted requirements and their identifiers."""
+# ---------------------------------------------------------
+# 5. Remove exact duplicates safely
+# ---------------------------------------------------------
 
-    if not requirements:
-        raise ValueError(
-            "No requirements were extracted from the document."
+def remove_exact_duplicates(
+    requirements: list[dict]
+) -> list[dict]:
+    """
+    Remove only exact textual duplicates within the same category.
+
+    Similar but differently worded requirements are preserved.
+    This avoids accidentally deleting distinct requirements.
+    """
+
+    unique_requirements = []
+    seen = set()
+
+    for requirement in requirements:
+
+        normalized_description = re.sub(
+            r"\s+",
+            " ",
+            requirement["description"].strip().lower()
         )
 
-    seen_ids = set()
-    validated_requirements = []
+        duplicate_key = (
+            requirement["category"],
+            normalized_description
+        )
+
+        if duplicate_key in seen:
+            continue
+
+        seen.add(duplicate_key)
+        unique_requirements.append(requirement)
+
+    return unique_requirements
+
+
+# ---------------------------------------------------------
+# 6. Consolidate semantic duplicates
+# ---------------------------------------------------------
+
+def consolidate_requirements(
+    candidate_requirements: list[dict]
+) -> list[dict]:
+    """
+    Ask the LLM to merge genuine semantic duplicates.
+
+    If the model removes too many requirements, retain the
+    original candidates after exact duplicate removal.
+    """
+
+    if not candidate_requirements:
+        return []
+
+    prompt = f"""
+You are a senior business analyst.
+
+Review the candidate requirements below and remove only genuine
+semantic duplicates.
+
+CANDIDATE REQUIREMENTS:
+
+{json.dumps(candidate_requirements, indent=2, ensure_ascii=False)}
+
+RULES:
+
+1. Two requirements are duplicates only when they describe
+   substantially the same underlying behaviour or business rule.
+
+2. Do not merge different behaviours, conditions, calculations,
+   constraints, assumptions or open questions.
+
+3. Preserve every distinct requirement.
+
+4. Preserve exact numbers, amounts, thresholds and conditions.
+
+5. Preserve the original category unless it is clearly incorrect.
+
+6. Never combine unrelated requirements into one general statement.
+
+7. Preserve source references. Combine source references only
+   when genuinely duplicate requirements are merged.
+
+8. Do not invent missing information.
+
+9. Do not create requirement IDs.
+
+10. The final result must retain all distinct candidate requirements.
+    Do not aggressively reduce the number of requirements.
+
+Return ONLY valid JSON:
+
+{{
+  "requirements": [
+    {{
+      "category": "BUSINESS_RULE",
+      "description": "Requirement description.",
+      "source": "Source reference."
+    }}
+  ]
+}}
+"""
+
+    response = generate_response(prompt)
+    parsed = parse_json_response(response)
+
+    consolidated = parsed.get("requirements")
+
+    if not isinstance(consolidated, list):
+        raise ValueError("Invalid consolidated requirements list.")
+
+    valid_consolidated = []
+
+    for requirement in consolidated:
+
+        if validate_requirement(requirement):
+
+            valid_consolidated.append({
+                "category": requirement["category"],
+                "description": requirement["description"].strip(),
+                "source": requirement["source"].strip()
+            })
+
+    # Safety check: prevent excessive loss of requirements.
+    minimum_expected = max(
+        2,
+        int(len(candidate_requirements) * 0.40)
+    )
+
+    if len(valid_consolidated) < minimum_expected:
+
+        print(
+            "\nWARNING: Consolidation removed too many requirements."
+        )
+
+        print(
+            "Keeping candidate requirements instead of using "
+            "the unreliable consolidated result."
+        )
+
+        return remove_exact_duplicates(candidate_requirements)
+
+    return remove_exact_duplicates(valid_consolidated)
+
+
+# ---------------------------------------------------------
+# 7. Assign final sequential requirement IDs
+# ---------------------------------------------------------
+
+def assign_requirement_ids(
+    requirements: list[dict]
+) -> list[dict]:
+
+    final_requirements = []
 
     for index, requirement in enumerate(requirements, start=1):
 
-        if not isinstance(requirement, dict):
-            raise ValueError("Invalid requirement format.")
+        final_requirements.append({
+            "requirement_id": f"REQ-{index:03d}",
+            "category": requirement["category"],
+            "description": requirement["description"],
+            "source": requirement["source"]
+        })
 
-        required_fields = [
-            "requirement_id",
-            "category",
-            "description",
-            "source"
-        ]
+    return final_requirements
 
-        for field in required_fields:
-            if field not in requirement:
-                raise ValueError(
-                    f"Requirement is missing the '{field}' field."
-                )
 
-        requirement_id = requirement["requirement_id"]
-
-        if not isinstance(requirement_id, str):
-            raise ValueError("Invalid requirement ID.")
-
-        expected_id = f"REQ-{index:03d}"
-
-        if requirement_id != expected_id:
-            raise ValueError(
-                f"Expected {expected_id}, received {requirement_id}."
-            )
-
-        if requirement_id in seen_ids:
-            raise ValueError(
-                f"Duplicate requirement ID: {requirement_id}"
-            )
-
-        seen_ids.add(requirement_id)
-
-        category = requirement["category"]
-
-        if not isinstance(category, str) or category not in VALID_CATEGORIES:
-            raise ValueError(
-                f"Invalid requirement category: {category}"
-            )
-
-        for field in ["description", "source"]:
-
-            if (
-                not isinstance(requirement[field], str)
-                or not requirement[field].strip()
-            ):
-                raise ValueError(
-                    f"Requirement has an invalid '{field}' field."
-                )
-
-        validated_requirements.append(requirement)
-
-    return validated_requirements
-
+# ---------------------------------------------------------
+# 8. Main extraction function
+# ---------------------------------------------------------
 
 def extract_requirements(document_text: str) -> list[dict]:
     """
-    Extract structured, non-duplicated requirements from an
-    uploaded business change-request document using Ollama.
-    """
+    Extract structured requirements from an uploaded document.
 
-    # ---------------------------------------------------------
-    # 1. Validate document text
-    # ---------------------------------------------------------
+    Processing stages:
+    1. Validate document text.
+    2. Split document into smaller chunks.
+    3. Extract requirements from each chunk.
+    4. Consolidate semantic duplicates.
+    5. Assign sequential requirement IDs.
+
+    The function signature remains compatible with
+    analysis_pipeline.py.
+    """
 
     if not isinstance(document_text, str) or not document_text.strip():
         raise ValueError("Document text cannot be empty.")
 
-    # ---------------------------------------------------------
-    # 2. Prepare extraction prompt
-    # ---------------------------------------------------------
+    print("\nStarting requirement extraction...")
 
-    prompt = f"""
-You are an experienced Business Analyst specializing in
-software requirements engineering.
+    # Step 1: Split document.
+    chunks = split_document_into_chunks(document_text)
 
-Analyse the complete business change-request document.
+    print(f"Document divided into {len(chunks)} sections.")
 
-Extract all distinct and relevant requirements accurately.
-Preserve important information without creating duplicates.
+    # Step 2: Extract requirements from each chunk.
+    candidate_requirements = []
 
-REQUIREMENT CATEGORIES:
-
-1. FUNCTIONAL:
-A specific capability or behaviour the system must provide.
-
-2. BUSINESS_RULE:
-A business policy, calculation, threshold, limit or decision rule.
-
-3. NON_FUNCTIONAL:
-A quality requirement such as performance, security,
-availability, reliability or usability.
-
-4. CONSTRAINT:
-A restriction or condition limiting the solution.
-
-5. ASSUMPTION:
-An explicitly stated or necessary but unconfirmed assumption.
-
-6. OPEN_QUESTION:
-An unresolved decision or question requiring clarification.
-
-IMPORTANT EXTRACTION RULES:
-
-A. SEMANTIC DEDUPLICATION
-
-This is extremely important.
-
-- Do not create multiple requirements describing the same behaviour.
-- Compare meaning, not just wording.
-- Do not repeat a business rule as a separate functional
-  requirement when both describe exactly the same behaviour.
-- Do not repeat the same numerical mapping in multiple entries.
-- If several document sections describe the same rule,
-  create one requirement and preserve the relevant source sections.
-- Keep genuinely different conditions as separate requirements.
-- Do not merge unrelated requirements just to reduce the count.
-
-Examples of duplication to avoid:
-
-- "Apply the correct limit based on account package."
-- "Determine the daily limit using the customer's package."
-
-If both describe the same behaviour, extract one requirement.
-
-B. PRESERVE BUSINESS VALUES
-
-Preserve every explicit mapping exactly.
-
-For example:
-
-- Basic -> EUR 1,000 per day
-- Premium -> EUR 3,000 per day
-- Business -> EUR 5,000 per day
-
-Do not omit or alter any amount, currency or package.
-
-C. DISTINGUISH EXISTING AND NEW BEHAVIOUR
-
-If the document describes an existing rule and then
-requests a change:
-
-- Preserve the existing rule as current-state information
-  only when it is relevant to understanding the change.
-- Extract the requested new rule separately.
-- Do not incorrectly present an unchanged existing rule
-  as a newly requested requirement.
-- Do not confuse existing behaviour with proposed behaviour.
-
-D. PRESERVE CONDITIONS
-
-Distinguish between:
-
-- Successful transactions
-- Failed transactions
-- Rejected transactions
-- Pending transactions
-- Reversed transactions
-- Cancelled transactions
-
-Do not assume their behaviour is identical.
-
-E. CLASSIFICATION ACCURACY
-
-Use NON_FUNCTIONAL only for actual quality requirements,
-such as security, performance, reliability and availability.
-
-Do not classify the following as NON_FUNCTIONAL merely
-because they are not direct user-facing functions:
-
-- Existing system capabilities
-- Currency assumptions
-- Account package identification assumptions
-- Existing business rules
-- General implementation context
-
-Use ASSUMPTION for unconfirmed assumptions.
-
-Use OPEN_QUESTION for unresolved decisions.
-
-Use CONSTRAINT for explicit restrictions.
-
-F. OPEN QUESTIONS
-
-Extract unresolved questions separately.
-
-Do not convert open questions into confirmed requirements.
-
-Do not invent answers for unresolved questions.
-
-G. SOURCE TRACEABILITY
-
-For each requirement, include the relevant section heading
-or section number.
-
-If a requirement appears in multiple sections, include
-all relevant source references in one source field.
-
-H. AVOID INVENTION
-
-- Do not invent business rules.
-- Do not invent acceptance criteria.
-- Do not assume a timezone.
-- Do not assume transaction states.
-- Do not assume account-level or customer-level scope
-  when the document leaves it unresolved.
-- Do not introduce implementation decisions absent
-  from the document.
-
-I. REQUIREMENT GRANULARITY
-
-Each entry must express one distinct requirement or
-one clearly related group of values.
-
-Preserve mappings together when they form one business rule.
-
-Do not create a separate requirement for every individual
-package value when they belong to the same mapping.
-
-J. IDENTIFIERS
-
-Generate sequential IDs:
-
-REQ-001, REQ-002, REQ-003 ...
-
-Assign IDs only after removing duplicates.
-
-RETURN ONLY VALID JSON:
-
-{{
-    "requirements": [
-        {{
-            "requirement_id": "REQ-001",
-            "category": "BUSINESS_RULE",
-            "description": "A complete and precise requirement.",
-            "source": "Section 4"
-        }}
-    ]
-}}
-
-Return exactly these fields for each requirement:
-
-- requirement_id
-- category
-- description
-- source
-
-Do not add explanations outside the JSON.
-
-DOCUMENT:
-
-{document_text}
-"""
-
-    # ---------------------------------------------------------
-    # 3. Generate and validate requirements
-    # ---------------------------------------------------------
-
-    last_error = None
-
-    for attempt in range(2):
+    for index, chunk in enumerate(chunks, start=1):
 
         print(
-            f"\nExtracting requirements "
-            f"(attempt {attempt + 1}/2)..."
+            f"\nProcessing section {index}/{len(chunks)}..."
         )
 
-        current_prompt = prompt
+        extracted = extract_from_chunk(chunk, index)
 
-        # Include the validation error when retrying.
-        if attempt == 1:
-            current_prompt += f"""
+        candidate_requirements.extend(extracted)
 
-YOUR PREVIOUS RESPONSE FAILED VALIDATION.
+        print(
+            f"Extracted {len(extracted)} requirements."
+        )
 
-Validation error:
-{last_error}
+    print(
+        f"\nTotal candidate requirements: "
+        f"{len(candidate_requirements)}"
+    )
 
-Please correct the response.
+    # Step 3: Consolidate duplicates.
+    print("\nConsolidating requirements...")
 
-Remember:
-- Remove semantically duplicated requirements.
-- Use only the allowed categories.
-- Generate sequential requirement IDs.
-- Return valid JSON only.
-"""
+    consolidated = consolidate_requirements(
+        candidate_requirements
+    )
 
-        response = generate_response(current_prompt)
+    print(
+        f"Requirements after consolidation: {len(consolidated)}"
+    )
 
-        try:
-            result = _parse_response(response)
+    # Step 4: Assign IDs.
+    final_requirements = assign_requirement_ids(
+        consolidated
+    )
 
-            requirements = _validate_requirements(
-                result["requirements"]
-            )
+    # Step 5: Display category counts.
+    category_counts = {}
 
-            print(
-                f"Successfully extracted "
-                f"{len(requirements)} validated requirements."
-            )
+    for requirement in final_requirements:
 
-            # Show a compact category summary.
-            category_counts = {}
+        category = requirement["category"]
 
-            for requirement in requirements:
-                category = requirement["category"]
+        category_counts[category] = (
+            category_counts.get(category, 0) + 1
+        )
 
-                category_counts[category] = (
-                    category_counts.get(category, 0) + 1
-                )
+    print("\nRequirement extraction completed.")
 
-            print("\nRequirement category summary:")
+    print(
+        f"Final requirements: {len(final_requirements)}"
+    )
 
-            for category, count in sorted(category_counts.items()):
-                print(f"  {category}: {count}")
+    print("\nCategory distribution:")
 
-            return requirements
+    for category, count in category_counts.items():
+        print(f"  {category}: {count}")
 
-        except ValueError as error:
-
-            last_error = str(error)
-
-            print(
-                f"Requirement extraction validation failed: "
-                f"{last_error}"
-            )
-
-            if attempt == 1:
-                raise ValueError(
-                    f"Requirement extraction failed after retry: "
-                    f"{last_error}"
-                ) from error
-
-    raise RuntimeError("Unexpected requirement extraction failure.")
+    return final_requirements
